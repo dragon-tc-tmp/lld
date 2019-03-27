@@ -650,10 +650,8 @@ void GotSection::finalizeContents() {
 
 bool GotSection::empty() const {
   // We need to emit a GOT even if it's empty if there's a relocation that is
-  // relative to GOT(such as GOTOFFREL) or there's a symbol that points to a GOT
-  // (i.e. _GLOBAL_OFFSET_TABLE_) that the target defines relative to the .got.
-  return NumEntries == 0 && !HasGotOffRel &&
-         !(ElfSym::GlobalOffsetTable && !Target->GotBaseSymInGotPlt);
+  // relative to GOT(such as GOTOFFREL).
+  return NumEntries == 0 && !HasGotOffRel;
 }
 
 void GotSection::writeTo(uint8_t *Buf) {
@@ -1114,11 +1112,9 @@ void GotPltSection::writeTo(uint8_t *Buf) {
 }
 
 bool GotPltSection::empty() const {
-  // We need to emit a GOT.PLT even if it's empty if there's a symbol that
-  // references the _GLOBAL_OFFSET_TABLE_ and the Target defines the symbol
-  // relative to the .got.plt section.
-  return Entries.empty() &&
-         !(ElfSym::GlobalOffsetTable && Target->GotBaseSymInGotPlt);
+  // We need to emit GOTPLT even if it's empty if there's a relocation relative
+  // to it.
+  return Entries.empty() && !HasGotPltOffRel;
 }
 
 static StringRef getIgotPltName() {
@@ -1205,25 +1201,6 @@ DynamicSection<ELFT>::DynamicSection()
   // ftp://www.linux-mips.org/pub/linux/mips/doc/ABI/mipsabi.pdf
   if (Config->EMachine == EM_MIPS || Config->ZRodynamic)
     this->Flags = SHF_ALLOC;
-
-  // Add strings to .dynstr early so that .dynstr's size will be
-  // fixed early.
-  for (StringRef S : Config->FilterList)
-    addInt(DT_FILTER, In.DynStrTab->addString(S));
-  for (StringRef S : Config->AuxiliaryList)
-    addInt(DT_AUXILIARY, In.DynStrTab->addString(S));
-
-  if (!Config->Rpath.empty())
-    addInt(Config->EnableNewDtags ? DT_RUNPATH : DT_RPATH,
-           In.DynStrTab->addString(Config->Rpath));
-
-  for (InputFile *File : SharedFiles) {
-    SharedFile<ELFT> *F = cast<SharedFile<ELFT>>(File);
-    if (F->IsNeeded)
-      addInt(DT_NEEDED, In.DynStrTab->addString(F->SoName));
-  }
-  if (!Config->SoName.empty())
-    addInt(DT_SONAME, In.DynStrTab->addString(Config->SoName));
 }
 
 template <class ELFT>
@@ -1277,6 +1254,23 @@ static uint64_t addPltRelSz() {
 
 // Add remaining entries to complete .dynamic contents.
 template <class ELFT> void DynamicSection<ELFT>::finalizeContents() {
+  for (StringRef S : Config->FilterList)
+    addInt(DT_FILTER, In.DynStrTab->addString(S));
+  for (StringRef S : Config->AuxiliaryList)
+    addInt(DT_AUXILIARY, In.DynStrTab->addString(S));
+
+  if (!Config->Rpath.empty())
+    addInt(Config->EnableNewDtags ? DT_RUNPATH : DT_RPATH,
+           In.DynStrTab->addString(Config->Rpath));
+
+  for (InputFile *File : SharedFiles) {
+    SharedFile<ELFT> *F = cast<SharedFile<ELFT>>(File);
+    if (F->IsNeeded)
+      addInt(DT_NEEDED, In.DynStrTab->addString(F->SoName));
+  }
+  if (!Config->SoName.empty())
+    addInt(DT_SONAME, In.DynStrTab->addString(Config->SoName));
+
   // Set DT_FLAGS and DT_FLAGS_1.
   uint32_t DtFlags = 0;
   uint32_t DtFlags1 = 0;
@@ -1567,10 +1561,6 @@ template <class ELFT> void RelocationSection<ELFT>::writeTo(uint8_t *Buf) {
     encodeDynamicReloc<ELFT>(reinterpret_cast<Elf_Rela *>(Buf), Rel);
     Buf += Config->IsRela ? sizeof(Elf_Rela) : sizeof(Elf_Rel);
   }
-}
-
-template <class ELFT> unsigned RelocationSection<ELFT>::getRelocOffset() {
-  return this->Entsize * Relocs.size();
 }
 
 template <class ELFT>
@@ -2331,15 +2321,18 @@ PltSection::PltSection(bool IsIplt)
 void PltSection::writeTo(uint8_t *Buf) {
   // At beginning of PLT or retpoline IPLT, we have code to call the dynamic
   // linker to resolve dynsyms at runtime. Write such code.
-  if (HeaderSize > 0)
+  if (HeaderSize)
     Target->writePltHeader(Buf);
   size_t Off = HeaderSize;
-  // The IPlt is immediately after the Plt, account for this in RelOff
-  unsigned PltOff = getPltRelocOff();
 
-  for (auto &I : Entries) {
-    const Symbol *B = I.first;
-    unsigned RelOff = I.second + PltOff;
+  RelocationBaseSection *RelSec = IsIplt ? In.RelaIplt : In.RelaPlt;
+
+  // The IPlt is immediately after the Plt, account for this in RelOff
+  size_t PltOff = IsIplt ? In.Plt->getSize() : 0;
+
+  for (size_t I = 0, E = Entries.size(); I != E; ++I) {
+    const Symbol *B = Entries[I];
+    unsigned RelOff = RelSec->Entsize * I + PltOff;
     uint64_t Got = B->getGotPltVA();
     uint64_t Plt = this->getVA() + Off;
     Target->writePlt(Buf + Off, Got, Plt, B->PltIndex, RelOff);
@@ -2349,12 +2342,7 @@ void PltSection::writeTo(uint8_t *Buf) {
 
 template <class ELFT> void PltSection::addEntry(Symbol &Sym) {
   Sym.PltIndex = Entries.size();
-  RelocationBaseSection *PltRelocSection = In.RelaPlt;
-  if (IsIplt)
-    PltRelocSection = In.RelaIplt;
-  unsigned RelOff =
-      static_cast<RelocationSection<ELFT> *>(PltRelocSection)->getRelocOffset();
-  Entries.push_back(std::make_pair(&Sym, RelOff));
+  Entries.push_back(&Sym);
 }
 
 size_t PltSection::getSize() const {
@@ -2367,15 +2355,12 @@ void PltSection::addSymbols() {
   // The PLT may have symbols defined for the Header, the IPLT has no header
   if (!IsIplt)
     Target->addPltHeaderSymbols(*this);
+
   size_t Off = HeaderSize;
   for (size_t I = 0; I < Entries.size(); ++I) {
     Target->addPltSymbols(*this, Off);
     Off += Target->PltEntrySize;
   }
-}
-
-unsigned PltSection::getPltRelocOff() const {
-  return IsIplt ? In.Plt->getSize() : 0;
 }
 
 // The string hash function for .gdb_index.
@@ -3018,7 +3003,6 @@ void elf::mergeSections() {
     }
 
     StringRef OutsecName = getOutputSectionName(MS);
-    uint32_t Alignment = std::max<uint32_t>(MS->Alignment, MS->Entsize);
 
     auto I = llvm::find_if(MergeSections, [=](MergeSyntheticSection *Sec) {
       // While we could create a single synthetic section for two different
@@ -3030,11 +3014,11 @@ void elf::mergeSections() {
       // Using Entsize in here also allows us to propagate it to the synthetic
       // section.
       return Sec->Name == OutsecName && Sec->Flags == MS->Flags &&
-             Sec->Entsize == MS->Entsize && Sec->Alignment == Alignment;
+             Sec->Entsize == MS->Entsize && Sec->Alignment == MS->Alignment;
     });
     if (I == MergeSections.end()) {
       MergeSyntheticSection *Syn =
-          createMergeSynthetic(OutsecName, MS->Type, MS->Flags, Alignment);
+          createMergeSynthetic(OutsecName, MS->Type, MS->Flags, MS->Alignment);
       MergeSections.push_back(Syn);
       I = std::prev(MergeSections.end());
       S = Syn;

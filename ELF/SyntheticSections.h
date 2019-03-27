@@ -31,7 +31,6 @@
 namespace lld {
 namespace elf {
 class Defined;
-class SharedSymbol;
 
 class SyntheticSection : public InputSection {
 public:
@@ -364,6 +363,10 @@ public:
   void writeTo(uint8_t *Buf) override;
   bool empty() const override;
 
+  // Flag to force GotPlt to be in output if we have relocations
+  // that relies on its address.
+  bool HasGotPltOffRel = false;
+
 private:
   std::vector<const Symbol *> Entries;
 };
@@ -418,7 +421,6 @@ public:
 
   uint64_t getOffset() const;
   uint32_t getSymIndex() const;
-  const InputSectionBase *getInputSec() const { return InputSec; }
 
   // Computes the addend of the dynamic relocation. Note that this is not the
   // same as the Addend member variable as it also includes the symbol address
@@ -499,7 +501,6 @@ class RelocationSection final : public RelocationBaseSection {
 
 public:
   RelocationSection(StringRef Name, bool Sort);
-  unsigned getRelocOffset();
   void writeTo(uint8_t *Buf) override;
 
 private:
@@ -665,8 +666,7 @@ public:
   size_t HeaderSize;
 
 private:
-  unsigned getPltRelocOff() const;
-  std::vector<std::pair<const Symbol *, unsigned>> Entries;
+  std::vector<const Symbol *> Entries;
   bool IsIplt;
 };
 

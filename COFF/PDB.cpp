@@ -180,6 +180,9 @@ public:
   /// Write the PDB to disk and store the Guid generated for it in *Guid.
   void commit(codeview::GUID *Guid);
 
+  // Print statistics regarding the final PDB
+  void printStats();
+
 private:
   BumpPtrAllocator Alloc;
 
@@ -222,6 +225,11 @@ private:
   /// List of TypeServer PDBs which cannot be loaded.
   /// Cached to prevent repeated load attempts.
   std::map<codeview::GUID, std::string> MissingTypeServerPDBs;
+
+  // For statistics
+  uint64_t GlobalSymbols = 0;
+  uint64_t ModuleSymbols = 0;
+  uint64_t PublicSymbols = 0;
 };
 
 class DebugSHandler {
@@ -1041,9 +1049,11 @@ void PDBLinker::mergeSymbolRecords(ObjFile *File, const CVIndexMap &IndexMap,
         // adding the symbol to the module since we may need to get the next
         // symbol offset, and writing to the module's symbol stream will update
         // that offset.
-        if (symbolGoesInGlobalsStream(Sym, Scopes.empty()))
+        if (symbolGoesInGlobalsStream(Sym, Scopes.empty())) {
           addGlobalSymbol(Builder.getGsiBuilder(),
                           File->ModuleDBI->getModuleIndex(), CurSymOffset, Sym);
+          ++GlobalSymbols;
+        }
 
         if (symbolGoesInModuleStream(Sym, Scopes.empty())) {
           // Add symbols to the module in bulk. If this symbol is contiguous
@@ -1057,6 +1067,7 @@ void PDBLinker::mergeSymbolRecords(ObjFile *File, const CVIndexMap &IndexMap,
             BulkSymbols = RecordBytes;
           }
           CurSymOffset += Sym.length();
+          ++ModuleSymbols;
         }
         return Error::success();
       }));
@@ -1077,13 +1088,13 @@ static ArrayRef<uint8_t> relocateDebugChunk(BumpPtrAllocator &Alloc,
 }
 
 static pdb::SectionContrib createSectionContrib(const Chunk *C, uint32_t Modi) {
-  OutputSection *OS = C->getOutputSection();
+  OutputSection *OS = C ? C->getOutputSection() : nullptr;
   pdb::SectionContrib SC;
   memset(&SC, 0, sizeof(SC));
-  SC.ISect = OS->SectionIndex;
-  SC.Off = C->getRVA() - OS->getRVA();
-  SC.Size = C->getSize();
-  if (auto *SecChunk = dyn_cast<SectionChunk>(C)) {
+  SC.ISect = OS ? OS->SectionIndex : llvm::pdb::kInvalidStreamIndex;
+  SC.Off = C && OS ? C->getRVA() - OS->getRVA() : 0;
+  SC.Size = C ? C->getSize() : -1;
+  if (auto *SecChunk = dyn_cast_or_null<SectionChunk>(C)) {
     SC.Characteristics = SecChunk->Header->Characteristics;
     SC.Imod = SecChunk->File->ModuleDBI->getModuleIndex();
     ArrayRef<uint8_t> Contents = SecChunk->getContents();
@@ -1093,7 +1104,7 @@ static pdb::SectionContrib createSectionContrib(const Chunk *C, uint32_t Modi) {
     CRC.update(CharContents);
     SC.DataCrc = CRC.getCRC();
   } else {
-    SC.Characteristics = OS->Header.Characteristics;
+    SC.Characteristics = OS ? OS->Header.Characteristics : 0;
     // FIXME: When we start creating DBI for import libraries, use those here.
     SC.Imod = Modi;
   }
@@ -1213,31 +1224,9 @@ void DebugSHandler::finish() {
 }
 
 void PDBLinker::addObjFile(ObjFile *File, CVIndexMap *ExternIndexMap) {
-  if (File->wasProcessedForPDB())
+  if (File->MergedIntoPDB)
     return;
-  // Add a module descriptor for every object file. We need to put an absolute
-  // path to the object into the PDB. If this is a plain object, we make its
-  // path absolute. If it's an object in an archive, we make the archive path
-  // absolute.
-  bool InArchive = !File->ParentName.empty();
-  SmallString<128> Path = InArchive ? File->ParentName : File->getName();
-  pdbMakeAbsolute(Path);
-  StringRef Name = InArchive ? File->getName() : StringRef(Path);
-
-  pdb::DbiStreamBuilder &DbiBuilder = Builder.getDbiBuilder();
-  File->ModuleDBI = &ExitOnErr(DbiBuilder.addModuleInfo(Name));
-  File->ModuleDBI->setObjFileName(Path);
-
-  auto Chunks = File->getChunks();
-  uint32_t Modi = File->ModuleDBI->getModuleIndex();
-  for (Chunk *C : Chunks) {
-    auto *SecChunk = dyn_cast<SectionChunk>(C);
-    if (!SecChunk || !SecChunk->Live)
-      continue;
-    pdb::SectionContrib SC = createSectionContrib(SecChunk, Modi);
-    File->ModuleDBI->setFirstSectionContrib(SC);
-    break;
-  }
+  File->MergedIntoPDB = true;
 
   // Before we can process symbol substreams from .debug$S, we need to process
   // type information, file checksums, and the string table.  Add type info to
@@ -1253,8 +1242,7 @@ void PDBLinker::addObjFile(ObjFile *File, CVIndexMap *ExternIndexMap) {
       consumeError(IndexMapResult.takeError());
       return;
     }
-    StringRef FileName = sys::path::filename(Path);
-    warn("Cannot use debug info for '" + FileName + "' [LNK4099]\n" +
+    warn("Cannot use debug info for '" + toString(File) + "' [LNK4099]\n" +
          ">>> failed to load reference " +
          StringRef(toString(IndexMapResult.takeError())));
     return;
@@ -1262,6 +1250,7 @@ void PDBLinker::addObjFile(ObjFile *File, CVIndexMap *ExternIndexMap) {
 
   ScopedTimer T(SymbolMergingTimer);
 
+  pdb::DbiStreamBuilder &DbiBuilder = Builder.getDbiBuilder();
   DebugSHandler DSH(*this, *File, *IndexMapResult);
   // Now do all live .debug$S and .debug$F sections.
   for (SectionChunk *DebugChunk : File->getDebugChunks()) {
@@ -1294,6 +1283,38 @@ void PDBLinker::addObjFile(ObjFile *File, CVIndexMap *ExternIndexMap) {
   DSH.finish();
 }
 
+// Add a module descriptor for every object file. We need to put an absolute
+// path to the object into the PDB. If this is a plain object, we make its
+// path absolute. If it's an object in an archive, we make the archive path
+// absolute.
+static void createModuleDBI(pdb::PDBFileBuilder &Builder) {
+  pdb::DbiStreamBuilder &DbiBuilder = Builder.getDbiBuilder();
+  SmallString<128> ObjName;
+
+  for (ObjFile *File : ObjFile::Instances) {
+
+    bool InArchive = !File->ParentName.empty();
+    ObjName = InArchive ? File->ParentName : File->getName();
+    pdbMakeAbsolute(ObjName);
+    StringRef ModName = InArchive ? File->getName() : StringRef(ObjName);
+
+    File->ModuleDBI = &ExitOnErr(DbiBuilder.addModuleInfo(ModName));
+    File->ModuleDBI->setObjFileName(ObjName);
+
+    ArrayRef<Chunk *> Chunks = File->getChunks();
+    uint32_t Modi = File->ModuleDBI->getModuleIndex();
+
+    for (Chunk *C : Chunks) {
+      auto *SecChunk = dyn_cast<SectionChunk>(C);
+      if (!SecChunk || !SecChunk->Live)
+        continue;
+      pdb::SectionContrib SC = createSectionContrib(SecChunk, Modi);
+      File->ModuleDBI->setFirstSectionContrib(SC);
+      break;
+    }
+  }
+}
+
 static PublicSym32 createPublic(Defined *Def) {
   PublicSym32 Pub(SymbolKind::S_PUB32);
   Pub.Name = Def->getName();
@@ -1315,6 +1336,9 @@ static PublicSym32 createPublic(Defined *Def) {
 // TpiData.
 void PDBLinker::addObjectsToPDB() {
   ScopedTimer T1(AddObjectsTimer);
+
+  createModuleDBI(Builder);
+
   for (ObjFile *File : ObjFile::Instances)
     addObjFile(File);
 
@@ -1339,6 +1363,7 @@ void PDBLinker::addObjectsToPDB() {
   });
 
   if (!Publics.empty()) {
+    PublicSymbols = Publics.size();
     // Sort the public symbols and add them to the stream.
     parallelSort(Publics, [](const PublicSym32 &L, const PublicSym32 &R) {
       return L.Name < R.Name;
@@ -1346,6 +1371,33 @@ void PDBLinker::addObjectsToPDB() {
     for (const PublicSym32 &Pub : Publics)
       GsiBuilder.addPublicSymbol(Pub);
   }
+}
+
+void PDBLinker::printStats() {
+  if (!Config->ShowSummary)
+    return;
+
+  SmallString<256> Buffer;
+  raw_svector_ostream Stream(Buffer);
+
+  Stream << center_justify("Summary", 80) << '\n'
+         << std::string(80, '-') << '\n';
+
+  auto Print = [&](uint64_t V, StringRef S) {
+    Stream << format_decimal(V, 15) << " " << S << '\n';
+  };
+
+  Print(ObjFile::Instances.size(),
+        "Input OBJ files (expanded from all cmd-line inputs)");
+  Print(TypeServerIndexMappings.size(), "PDB type server dependencies");
+  Print(PrecompTypeIndexMappings.size(), "Precomp OBJ dependencies");
+  Print(getTypeTable().size() + getIDTable().size(), "Merged TPI records");
+  Print(PDBStrTab.size(), "Output PDB strings");
+  Print(GlobalSymbols, "Global symbol records");
+  Print(ModuleSymbols, "Module symbol records");
+  Print(PublicSymbols, "Public symbol records");
+
+  message(Buffer);
 }
 
 void PDBLinker::addNatvisFiles() {
@@ -1493,6 +1545,10 @@ void coff::createPDB(SymbolTable *Symtab,
   codeview::GUID Guid;
   PDB.commit(&Guid);
   memcpy(&BuildId->PDB70.Signature, &Guid, 16);
+
+  T2.stop();
+  T1.stop();
+  PDB.printStats();
 }
 
 void PDBLinker::initialize(llvm::codeview::DebugInfo *BuildId) {
@@ -1545,6 +1601,13 @@ void PDBLinker::addSections(ArrayRef<OutputSection *> OutputSections,
       Builder.getDbiBuilder().addSectionContrib(SC);
     }
   }
+
+  // The * Linker * first section contrib is only used along with /INCREMENTAL,
+  // to provide trampolines thunks for incremental function patching. Set this
+  // as "unused" because LLD doesn't support /INCREMENTAL link.
+  pdb::SectionContrib SC =
+      createSectionContrib(nullptr, llvm::pdb::kInvalidStreamIndex);
+  LinkerModule.setFirstSectionContrib(SC);
 
   // Add Section Map stream.
   ArrayRef<object::coff_section> Sections = {
