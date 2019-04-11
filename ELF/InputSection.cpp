@@ -71,6 +71,7 @@ InputSectionBase::InputSectionBase(InputFile *File, uint64_t Flags,
 
   NumRelocations = 0;
   AreRelocsRela = false;
+  Debug = Name.startswith(".debug") || Name.startswith(".zdebug");
 
   // The ELF spec states that a value of 0 means the section has
   // no alignment constraits.
@@ -210,8 +211,8 @@ OutputSection *SectionBase::getOutputSection() {
 // by zlib-compressed data. This function parses a header to initialize
 // `UncompressedSize` member and remove the header from `RawData`.
 void InputSectionBase::parseCompressedHeader() {
-  typedef typename ELF64LE::Chdr Chdr64;
-  typedef typename ELF32LE::Chdr Chdr32;
+  using Chdr64 = typename ELF64LE::Chdr;
+  using Chdr32 = typename ELF32LE::Chdr;
 
   // Old-style header
   if (Name.startswith(".zdebug")) {
@@ -380,7 +381,7 @@ OutputSection *InputSection::getParent() const {
 // Copy SHT_GROUP section contents. Used only for the -r option.
 template <class ELFT> void InputSection::copyShtGroup(uint8_t *Buf) {
   // ELFT::Word is the 32-bit integral type in the target endianness.
-  typedef typename ELFT::Word u32;
+  using u32 = typename ELFT::Word;
   ArrayRef<u32> From = getDataAs<u32>();
   auto *To = reinterpret_cast<u32 *>(Buf);
 
