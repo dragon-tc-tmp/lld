@@ -752,7 +752,6 @@ bool ScriptParser::readSectionDirective(OutputSection *Cmd, StringRef Tok1, Stri
   } else {
     skip(); // This is "COPY", "INFO" or "OVERLAY".
     Cmd->NonAlloc = true;
-    Cmd->Type = SHT_PROGBITS;
   }
   expect(")");
   return true;
@@ -1155,6 +1154,7 @@ Expr ScriptParser::readPrimary() {
   if (Tok == "ADDR") {
     StringRef Name = readParenLiteral();
     OutputSection *Sec = Script->getOrCreateOutputSection(Name);
+    Sec->UsedInExpression = true;
     return [=]() -> ExprValue {
       checkIfExists(Sec, Location);
       return {Sec, false, 0, Location};
@@ -1231,6 +1231,7 @@ Expr ScriptParser::readPrimary() {
   if (Tok == "LOADADDR") {
     StringRef Name = readParenLiteral();
     OutputSection *Cmd = Script->getOrCreateOutputSection(Name);
+    Cmd->UsedInExpression = true;
     return [=] {
       checkIfExists(Cmd, Location);
       return Cmd->getLMA();
