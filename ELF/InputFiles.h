@@ -146,10 +146,11 @@ public:
   // Index of MIPS GOT built for this file.
   llvm::Optional<size_t> MipsGotIndex;
 
+  std::vector<Symbol *> Symbols;
+
 protected:
   InputFile(Kind K, MemoryBufferRef M);
   std::vector<InputSectionBase *> Sections;
-  std::vector<Symbol *> Symbols;
   llvm::DenseSet<StringRef> Undefs;
 
 private:
@@ -263,7 +264,6 @@ private:
   StringRef getSectionName(const Elf_Shdr &Sec);
 
   bool shouldMerge(const Elf_Shdr &Sec);
-  Symbol *createSymbol(const Elf_Sym *Sym);
 
   // Each ELF symbol contains a section index which the symbol belongs to.
   // However, because the number of bits dedicated for that is limited, a
@@ -315,9 +315,7 @@ public:
   static bool classof(const InputFile *F) { return F->kind() == LazyObjKind; }
 
   template <class ELFT> void parse();
-  MemoryBufferRef getBuffer();
-  InputFile *fetch();
-  bool AddedToLink = false;
+  void fetch();
 
 private:
   uint64_t OffsetInArchive;
@@ -332,9 +330,9 @@ public:
 
   // Pulls out an object file that contains a definition for Sym and
   // returns it. If the same file was instantiated before, this
-  // function returns a nullptr (so we don't instantiate the same file
+  // function does nothing (so we don't instantiate the same file
   // more than once.)
-  InputFile *fetch(const Archive::Symbol &Sym);
+  void fetch(const Archive::Symbol &Sym);
 
 private:
   std::unique_ptr<Archive> File;

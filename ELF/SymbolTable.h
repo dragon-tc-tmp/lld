@@ -10,21 +10,12 @@
 #define LLD_ELF_SYMBOL_TABLE_H
 
 #include "InputFiles.h"
-#include "LTO.h"
 #include "lld/Common/Strings.h"
 #include "llvm/ADT/CachedHashString.h"
 #include "llvm/ADT/DenseMap.h"
 
 namespace lld {
 namespace elf {
-
-class CommonSymbol;
-class Defined;
-class LazyArchive;
-class LazyObject;
-class SectionBase;
-class SharedSymbol;
-class Undefined;
 
 // SymbolTable is a bucket of all known symbols, including defined,
 // undefined, or lazy symbols (the last one is symbols in archive
@@ -40,7 +31,6 @@ class Undefined;
 // is one add* function per symbol type.
 class SymbolTable {
 public:
-  template <class ELFT> void addCombinedLTOObject();
   void wrap(Symbol *Sym, Symbol *Real, Symbol *Wrap);
 
   ArrayRef<Symbol *> getSymbols() const { return SymVector; }
@@ -48,8 +38,6 @@ public:
   Symbol *insert(StringRef Name);
 
   Symbol *addSymbol(const Symbol &New);
-
-  void fetchLazy(Symbol *Sym);
 
   template <class ELFT> void scanShlibUndefined();
   void scanVersionScript();
@@ -93,15 +81,9 @@ private:
   // can have the same name. We use this map to handle "extern C++ {}"
   // directive in version scripts.
   llvm::Optional<llvm::StringMap<std::vector<Symbol *>>> DemangledSyms;
-
-  // For LTO.
-  std::unique_ptr<BitcodeCompiler> LTO;
 };
 
 extern SymbolTable *Symtab;
-
-void mergeSymbolProperties(Symbol *Old, const Symbol &New);
-void resolveSymbol(Symbol *Old, const Symbol &New);
 
 } // namespace elf
 } // namespace lld
